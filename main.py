@@ -9,6 +9,8 @@ from torchvision import datasets, models, transforms
 from skimage import color, img_as_float
 from skimage.restoration import denoise_nl_means, estimate_sigma
 from PIL import Image
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 # ==========================================
 # 1. CLASSE DE FILTRAGEM (Orientada a Objetos)
@@ -47,22 +49,21 @@ class FiltroNLM(object):
 # ==========================================
 # 2. CONFIGURAÇÃO DE HIPERPARÂMETROS E DADOS
 # ==========================================
-# Mantemos o Fator 0.8 que deu o melhor resultado
 FATOR_RUIDO = 0.8 
 
 print(f"Iniciando pipeline com h_factor = {FATOR_RUIDO} e Data Augmentation")
 
-# 1. Transformações de Treino (COM Augmentation)
+# Transformações de Treino (COM Augmentation)
 transformacoes_treino = transforms.Compose([
     transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(p=0.5), # 50% de chance de espelhar horizontalmente
-    transforms.RandomRotation(degrees=10),  # Rotaciona a imagem entre -10 e +10 graus
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(degrees=10),
     FiltroNLM(h_factor=FATOR_RUIDO),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# 2. Transformações de Validação (SEM Augmentation - Mundo Real)
+# Transformações de Validação (SEM Augmentation - Mundo Real)
 transformacoes_val = transforms.Compose([
     transforms.Resize((224, 224)),
     FiltroNLM(h_factor=FATOR_RUIDO),
@@ -72,13 +73,11 @@ transformacoes_val = transforms.Compose([
 
 diretorio_base = 'data'
 
-# Aplicando as transformações corretas para cada pasta
 datasets_img = {
     'train': datasets.ImageFolder(os.path.join(diretorio_base, 'train'), transformacoes_treino),
     'val': datasets.ImageFolder(os.path.join(diretorio_base, 'val'), transformacoes_val)
 }
 
-# DataLoader cuida do batching (enviar de 32 em 32 imagens)
 dataloaders = {x: torch.utils.data.DataLoader(datasets_img[x], batch_size=32, 
                                               shuffle=True, num_workers=0)
                for x in ['train', 'val']}
@@ -91,11 +90,9 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # ==========================================
 modelo = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
 
-# Congela os pesos das camadas convolucionais (já sabem extrair características)
 for param in modelo.parameters():
     param.requires_grad = False
 
-# Substitui a última camada (Totalmente Conectada) para as nossas 2 classes
 num_ftrs = modelo.fc.in_features
 modelo.fc = nn.Linear(num_ftrs, 2)
 modelo = modelo.to(device)
@@ -104,12 +101,17 @@ criterio = nn.CrossEntropyLoss()
 otimizador = optim.Adam(modelo.fc.parameters(), lr=0.001)
 
 # ==========================================
-# 4. LOOP DE TREINAMENTO
+# 4. LOOP DE TREINAMENTO (Com Histórico)
 # ==========================================
 def treinar_modelo(modelo, criterio, otimizador, epocas=3):
     desde = time.time()
     melhor_modelo_wts = copy.deepcopy(modelo.state_dict())
     melhor_acc = 0.0
+
+    historico_loss_treino = []
+    historico_loss_val = []
+    historico_acc_treino = []
+    historico_acc_val = []
 
     for epoca in range(epocas):
         print(f'Época {epoca+1}/{epocas}')
@@ -124,20 +126,17 @@ def treinar_modelo(modelo, criterio, otimizador, epocas=3):
             running_loss = 0.0
             running_corrects = 0
 
-            # Itera sobre os dados
             for inputs, labels in dataloaders[fase]:
                 inputs = inputs.to(device)
                 labels = labels.to(device)
 
                 otimizador.zero_grad()
 
-                # Forward
                 with torch.set_grad_enabled(fase == 'train'):
                     outputs = modelo(inputs)
                     _, preds = torch.max(outputs, 1)
                     loss = criterio(outputs, labels)
 
-                    # Backward + Otimização apenas no treino
                     if fase == 'train':
                         loss.backward()
                         otimizador.step()
@@ -150,7 +149,13 @@ def treinar_modelo(modelo, criterio, otimizador, epocas=3):
 
             print(f'{fase.capitalize()} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
 
-            # Salva o melhor modelo
+            if fase == 'train':
+                historico_loss_treino.append(epoch_loss)
+                historico_acc_treino.append(epoch_acc.item())
+            else:
+                historico_loss_val.append(epoch_loss)
+                historico_acc_val.append(epoch_acc.item())
+
             if fase == 'val' and epoch_acc > melhor_acc:
                 melhor_acc = epoch_acc
                 melhor_modelo_wts = copy.deepcopy(modelo.state_dict())
@@ -162,7 +167,67 @@ def treinar_modelo(modelo, criterio, otimizador, epocas=3):
     print(f'Melhor Acurácia de Validação: {melhor_acc:4f}')
 
     modelo.load_state_dict(melhor_modelo_wts)
-    return modelo
+    return modelo, historico_loss_treino, historico_loss_val, historico_acc_treino, historico_acc_val
 
-# Executa o treino (coloquei 3 épocas para rodar rápido)
-modelo_treinado = treinar_modelo(modelo, criterio, otimizador, epocas=3)
+# ==========================================
+# 5. FUNÇÕES PARA GERAR OS GRÁFICOS
+# ==========================================
+def plotar_resultados(hist_loss_t, hist_loss_v, hist_acc_t, hist_acc_v):
+    epocas = range(1, len(hist_loss_t) + 1)
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    ax1.plot(epocas, hist_loss_t, 'b-', marker='o', label='Treino Loss')
+    ax1.plot(epocas, hist_loss_v, 'r-', marker='o', label='Validação Loss')
+    ax1.set_title('Evolução do Erro (Loss)')
+    ax1.set_xlabel('Épocas')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax1.grid(True)
+    
+    ax2.plot(epocas, hist_acc_t, 'b-', marker='o', label='Treino Acc')
+    ax2.plot(epocas, hist_acc_v, 'r-', marker='o', label='Validação Acc')
+    ax2.set_title('Evolução da Acurácia')
+    ax2.set_xlabel('Épocas')
+    ax2.set_ylabel('Acurácia')
+    ax2.legend()
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('curvas_aprendizagem.png')
+    plt.show()
+
+def gerar_matriz_confusao(modelo, dataloader_val):
+    modelo.eval()
+    todas_preds = []
+    todas_labels = []
+    
+    with torch.no_grad():
+        for inputs, labels in dataloader_val:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = modelo(inputs)
+            _, preds = torch.max(outputs, 1)
+            
+            todas_preds.extend(preds.cpu().numpy())
+            todas_labels.extend(labels.cpu().numpy())
+            
+    cm = confusion_matrix(todas_labels, todas_preds)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Normal', 'Pneumonia'])
+    disp.plot(cmap=plt.cm.Blues)
+    plt.title('Matriz de Confusão - Validação')
+    plt.savefig('matriz_confusao.png')
+    plt.show()
+
+# ==========================================
+# 6. EXECUÇÃO PRINCIPAL
+# ==========================================
+if __name__ == '__main__':
+    # Treina o modelo e guarda o histórico
+    modelo_treinado, loss_t, loss_v, acc_t, acc_v = treinar_modelo(modelo, criterio, otimizador, epocas=3)
+
+    # Gera e salva os gráficos
+    print("\nGerando gráficos...")
+    plotar_resultados(loss_t, loss_v, acc_t, acc_v)
+    gerar_matriz_confusao(modelo_treinado, dataloaders['val'])
+    print("Gráficos salvos como 'curvas_aprendizagem.png' e 'matriz_confusao.png' na pasta do projeto.")
